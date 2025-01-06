@@ -139,7 +139,6 @@ class CameraServiceListener : public BnCameraServiceListener {
 class CameraDeviceCallback : public BnCameraDeviceCallback {
    public:
     enum LocalCameraDeviceStatus {
-        IDLE,
         ERROR,
         RUNNING,
         RESULT_RECEIVED,
@@ -148,6 +147,8 @@ class CameraDeviceCallback : public BnCameraDeviceCallback {
     };
 
    protected:
+    bool mSupportsPartialResults = false;
+    int32_t mPartialResultCount = 0;
     bool mError = false;
     LocalCameraDeviceStatus mLastStatus = UNINITIALIZED;
     mutable std::vector<LocalCameraDeviceStatus> mStatusesHit;
@@ -156,9 +157,11 @@ class CameraDeviceCallback : public BnCameraDeviceCallback {
     mutable Mutex mLock;
     mutable Condition mStatusCondition;
     mutable Condition mPreparedCondition;
+    mutable bool mIsIdle = false;
 
    public:
-    CameraDeviceCallback() {}
+    CameraDeviceCallback(bool supportsPartialResults, int32_t partialResultCount) :
+        mSupportsPartialResults(supportsPartialResults), mPartialResultCount(partialResultCount) {}
 
     ndk::ScopedAStatus onDeviceError(ErrorCode in_errorCode,
                                      const CaptureResultExtras& /*in_resultExtras*/) override {
@@ -173,8 +176,7 @@ class CameraDeviceCallback : public BnCameraDeviceCallback {
 
     ndk::ScopedAStatus onDeviceIdle() override {
         Mutex::Autolock l(mLock);
-        mLastStatus = IDLE;
-        mStatusesHit.push_back(mLastStatus);
+        mIsIdle = true;
         mStatusCondition.broadcast();
         return ndk::ScopedAStatus::ok();
     }
@@ -183,14 +185,21 @@ class CameraDeviceCallback : public BnCameraDeviceCallback {
                                         int64_t /*in_timestamp*/) override {
         Mutex::Autolock l(mLock);
         mLastStatus = RUNNING;
+        mIsIdle = false;
         mStatusesHit.push_back(mLastStatus);
         mStatusCondition.broadcast();
         return ndk::ScopedAStatus::ok();
     }
 
     ndk::ScopedAStatus onResultReceived(
-        const CaptureMetadataInfo& /*in_result*/, const CaptureResultExtras& /*in_resultExtras*/,
+        const CaptureMetadataInfo& /*in_result*/, const CaptureResultExtras& in_resultExtras,
         const std::vector<PhysicalCaptureResultInfo>& /*in_physicalCaptureResultInfos*/) override {
+        if (mSupportsPartialResults &&
+                (in_resultExtras.partialResultCount != mPartialResultCount)) {
+            ALOGV("%s: Ignoring requestId: %d parial count: %d", __FUNCTION__,
+                    in_resultExtras.requestId, in_resultExtras.partialResultCount);
+            return ndk::ScopedAStatus::ok();
+        }
         Mutex::Autolock l(mLock);
         mLastStatus = RESULT_RECEIVED;
         mStatusesHit.push_back(mLastStatus);
@@ -217,6 +226,10 @@ class CameraDeviceCallback : public BnCameraDeviceCallback {
         return ndk::ScopedAStatus::ok();
     }
 
+    ndk::ScopedAStatus onClientSharedAccessPriorityChanged(bool /*isPrimaryClient*/) override {
+        return ndk::ScopedAStatus::ok();
+    }
+
     bool waitForPreparedCount(int streamId, int count) const {
         Mutex::Autolock l(mLock);
         if ((mStreamsPreparedCount.find(streamId) != mStreamsPreparedCount.end()) &&
@@ -234,24 +247,30 @@ class CameraDeviceCallback : public BnCameraDeviceCallback {
     }
 
     // Test helper functions:
-    bool waitForStatus(LocalCameraDeviceStatus status) const {
+    bool waitForStatus(LocalCameraDeviceStatus status, int count) const {
         Mutex::Autolock l(mLock);
-        if (mLastStatus == status) {
-            return true;
-        }
-
-        while (std::find(mStatusesHit.begin(), mStatusesHit.end(), status) == mStatusesHit.end()) {
+        while (std::count(mStatusesHit.begin(), mStatusesHit.end(), status) < count) {
             if (mStatusCondition.waitRelative(mLock, IDLE_TIMEOUT) != android::OK) {
                 mStatusesHit.clear();
                 return false;
             }
         }
         mStatusesHit.clear();
-
         return true;
     }
 
-    bool waitForIdle() const { return waitForStatus(IDLE); }
+    // There is a *very* slim change of onCaptureStarted gets delayed after onIdle in
+    // cameraserver. If that happens, this wait will become invalid.
+    bool waitForIdle() const {
+        Mutex::Autolock l(mLock);
+        while (!mIsIdle) {
+            if (mStatusCondition.waitRelative(mLock, IDLE_TIMEOUT) != android::OK) {
+                return false;
+            }
+        }
+
+        return true;
+    }
 };
 
 static bool convertFromAidlCloned(const AidlCameraMetadata& metadata, CameraMetadata* rawMetadata) {
@@ -405,8 +424,17 @@ class VtsAidlCameraServiceTargetTest : public ::testing::TestWithParam<std::stri
             EXPECT_TRUE(cStatus);
             EXPECT_FALSE(rawMetadata.isEmpty());
 
+            bool partialResultSupported = false;
+            int32_t partialResultCount = 0;
+            auto entry = rawMetadata.find(ANDROID_REQUEST_PARTIAL_RESULT_COUNT);
+            if (entry.count > 0) {
+                partialResultCount = entry.data.i32[0];
+                partialResultSupported = true;
+            }
+
             std::shared_ptr<CameraDeviceCallback> callbacks =
-                ndk::SharedRefBase::make<CameraDeviceCallback>();
+                ndk::SharedRefBase::make<CameraDeviceCallback>(partialResultSupported,
+                        partialResultCount);
             std::shared_ptr<ICameraDeviceUser> deviceRemote = nullptr;
             ret = mCameraService->connectDevice(callbacks, it.cameraId, &deviceRemote);
             EXPECT_TRUE(ret.isOk());
@@ -515,7 +543,7 @@ class VtsAidlCameraServiceTargetTest : public ::testing::TestWithParam<std::stri
             EXPECT_TRUE(ret.isOk());
             EXPECT_GE(info.requestId, 0);
             EXPECT_TRUE(callbacks->waitForStatus(
-                CameraDeviceCallback::LocalCameraDeviceStatus::RESULT_RECEIVED));
+                CameraDeviceCallback::LocalCameraDeviceStatus::RESULT_RECEIVED, kNumRequests));
             EXPECT_TRUE(callbacks->waitForIdle());
 
             // Test repeating requests
@@ -531,7 +559,7 @@ class VtsAidlCameraServiceTargetTest : public ::testing::TestWithParam<std::stri
             ret = deviceRemote->submitRequestList({captureRequest}, true, &info);
             EXPECT_TRUE(ret.isOk());
             EXPECT_TRUE(callbacks->waitForStatus(
-                CameraDeviceCallback::LocalCameraDeviceStatus::RESULT_RECEIVED));
+                CameraDeviceCallback::LocalCameraDeviceStatus::RESULT_RECEIVED, 1));
 
             int64_t lastFrameNumber = -1;
             ret = deviceRemote->cancelRepeatingRequest(&lastFrameNumber);
@@ -631,6 +659,139 @@ TEST_P(VtsAidlCameraServiceTargetTest, CameraServiceListenerTest) {
         }
     }
 
+    ret = mCameraService->removeListener(listener);
+    EXPECT_TRUE(ret.isOk());
+}
+
+TEST_P(VtsAidlCameraServiceTargetTest, SharedCameraTest) {
+    if (mCameraService == nullptr) {
+        ALOGE("Cameraservice is not available");
+        return;
+    }
+
+    std::shared_ptr<CameraServiceListener> listener =
+        ::ndk::SharedRefBase::make<CameraServiceListener>();
+    std::vector<CameraStatusAndId> cameraStatuses;
+    ndk::ScopedAStatus ret = mCameraService->addListener(listener, &cameraStatuses);
+    EXPECT_TRUE(ret.isOk());
+    listener->initializeStatuses(cameraStatuses);
+    for (const auto& it : cameraStatuses) {
+        if (it.deviceStatus != CameraDeviceStatus::STATUS_PRESENT) {
+            continue;
+        }
+        AidlCameraMetadata aidlMetadata;
+        CameraMetadata rawMetadata;
+        ret = mCameraService->getCameraCharacteristics(it.cameraId, &aidlMetadata);
+        EXPECT_TRUE(ret.isOk());
+        bool cStatus = convertFromAidlCloned(aidlMetadata, &rawMetadata);
+        EXPECT_TRUE(cStatus);
+        EXPECT_FALSE(rawMetadata.isEmpty());
+
+        // Shared camera is only supported for system cameras.
+        bool isSystemCamera =
+            doesCapabilityExist(rawMetadata, ANDROID_REQUEST_AVAILABLE_CAPABILITIES_SYSTEM_CAMERA);
+        if (!isSystemCamera) {
+            continue;
+        }
+
+        auto entry = rawMetadata.find(ANDROID_SHARED_SESSION_OUTPUT_CONFIGURATIONS);
+        if (entry.count <= 0) {
+            continue;
+        }
+        int32_t width, height, format, physicalCamIdLen;
+        width = -1;
+
+        // From frameworks/av/camera/include/camera/camera2/OutputConfiguration.h
+        const int SURFACE_TYPE_IMAGE_READER = 4;
+        for (size_t i = 0; i < entry.count;) {
+            if (entry.data.i64[i] == SURFACE_TYPE_IMAGE_READER) {
+                width = entry.data.i64[i + 1];
+                height = entry.data.i64[i + 2];
+                format = entry.data.i64[i + 3];
+                break;
+            }
+            physicalCamIdLen = i + 10;
+            i += 11 + physicalCamIdLen;
+        }
+
+        if (width == -1) {
+            continue;
+        }
+
+        bool partialResultSupported = false;
+        int32_t partialResultCount = 0;
+        entry = rawMetadata.find(ANDROID_REQUEST_PARTIAL_RESULT_COUNT);
+        if (entry.count > 0) {
+            partialResultCount = entry.data.i32[0];
+            partialResultSupported = true;
+        }
+
+        std::shared_ptr<CameraDeviceCallback> callbacks =
+            ndk::SharedRefBase::make<CameraDeviceCallback>(partialResultSupported,
+                                                           partialResultCount);
+        std::shared_ptr<ICameraDeviceUser> deviceRemote = nullptr;
+        ret = mCameraService->connectDeviceV2(callbacks, it.cameraId, /*sharedMode*/ true,
+                                              &deviceRemote);
+        EXPECT_TRUE(ret.isOk());
+        EXPECT_TRUE(deviceRemote != nullptr);
+        bool isPrimaryClient;
+        ret = deviceRemote->isPrimaryClient(&isPrimaryClient);
+        EXPECT_TRUE(ret.isOk());
+        // Since this is the only client, it should be the primary client.
+        EXPECT_TRUE(isPrimaryClient);
+        status_t status = OK;
+        AImageReader* reader = nullptr;
+        const int NUM_TEST_IMAGES = 10;
+        status = AImageReader_new(width, height, format, NUM_TEST_IMAGES, &reader);
+        EXPECT_EQ(status, AMEDIA_OK);
+        scoped_unique_image_reader readerPtr =
+            scoped_unique_image_reader(reader, AImageReader_delete);
+        ANativeWindow* anw = nullptr;
+        status = AImageReader_getWindow(readerPtr.get(), &anw);
+        EXPECT_TRUE(status == AMEDIA_OK && anw != nullptr);
+
+        OutputConfiguration output = createOutputConfiguration({anw});
+
+        ret = deviceRemote->beginConfigure();
+        EXPECT_TRUE(ret.isOk());
+
+        int32_t streamId = -1;
+        ret = deviceRemote->createStream(output, &streamId);
+        EXPECT_TRUE(ret.isOk());
+        EXPECT_TRUE(streamId >= 0);
+
+        AidlCameraMetadata sessionParams;
+        ret = deviceRemote->endConfigure(StreamConfigurationMode::NORMAL_MODE, sessionParams,
+                                         systemTime());
+        EXPECT_TRUE(ret.isOk());
+
+        SubmitInfo info;
+        std::vector<int> streamIds;
+        std::vector<int> surfaceIds;
+        streamIds.push_back(streamId);
+        surfaceIds.push_back(0);
+        ret = deviceRemote->startStreaming(streamIds, surfaceIds, &info);
+        EXPECT_TRUE(ret.isOk());
+        EXPECT_GE(info.requestId, 0);
+        EXPECT_TRUE(callbacks->waitForStatus(
+            CameraDeviceCallback::LocalCameraDeviceStatus::RESULT_RECEIVED, 1));
+
+        int64_t lastFrameNumber = -1;
+        ret = deviceRemote->cancelRepeatingRequest(&lastFrameNumber);
+        EXPECT_TRUE(ret.isOk());
+        EXPECT_GE(lastFrameNumber, 0);
+
+        // Test waitUntilIdle()
+        ret = deviceRemote->waitUntilIdle();
+        EXPECT_TRUE(ret.isOk());
+
+        // Test deleteStream()
+        ret = deviceRemote->deleteStream(streamId);
+        EXPECT_TRUE(ret.isOk());
+
+        ret = deviceRemote->disconnect();
+        EXPECT_TRUE(ret.isOk());
+    }
     ret = mCameraService->removeListener(listener);
     EXPECT_TRUE(ret.isOk());
 }

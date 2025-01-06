@@ -49,4 +49,6 @@ interface ICameraDeviceUser {
   android.frameworks.cameraservice.device.SubmitInfo submitRequestList(in android.frameworks.cameraservice.device.CaptureRequest[] requestList, in boolean isRepeating);
   void updateOutputConfiguration(in int streamId, in android.frameworks.cameraservice.device.OutputConfiguration outputConfiguration);
   void waitUntilIdle();
+  boolean isPrimaryClient();
+  android.frameworks.cameraservice.device.SubmitInfo startStreaming(in int[] streamIdxArray, in int[] surfaceIdxArray);
 }
