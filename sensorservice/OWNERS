@@ -1,1 +1,2 @@
 # Bug component:151862
+include platform/frameworks/native:/services/sensorservice/OWNERS

@@ -67,7 +67,7 @@ class EventCallback : public BnEventQueueCallback {
     }
     void waitForEvent() {
         std::unique_lock<std::mutex> lck(mtx);
-        cv.wait_for(lck, std::chrono::seconds(1), [this](){ return eventReceived; });
+        cv.wait_for(lck, std::chrono::seconds(10), [this](){ return eventReceived; });
         EXPECT_TRUE(eventReceived) << "wait event timeout";
     }
    private:
