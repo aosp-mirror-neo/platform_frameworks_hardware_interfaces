@@ -262,4 +262,26 @@ interface ICameraDeviceUser {
      *      Status::INVALID_OPERATION if there are active repeating requests.
      */
     void waitUntilIdle();
+
+    /**
+     * Get the client status as primary or secondary when camera is opened in shared mode.
+     *
+     * @return true if this is primary client when camera is opened in shared mode.
+     *         false if another higher priority client with primary access is also using the camera.
+     */
+    boolean isPrimaryClient();
+
+    /**
+     * For shared capture session, send request to start streaming on the surfaces provided.
+     *
+     * @param streamIdxArray The list of stream ids
+     * @param surfaceIdxArray The list of surface ids
+     *
+     * @throws ServiceSpecificException on failure with error code set to Status corresponding to
+     *         the specific failure.
+     * @return SubmitInfo data structure containing the request id of the capture request and the
+     *         frame number of the last request, of the previous batch of repeating requests, if
+     *         any. If there is no previous  batch, the frame number returned will be -1.
+     */
+    SubmitInfo startStreaming(in int[] streamIdxArray, in int[] surfaceIdxArray);
 }
